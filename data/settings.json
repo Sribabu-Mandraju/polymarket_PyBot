@@ -1,0 +1,20 @@
+{
+  "1360354055": {
+    "maxPriceNoTokens": 0.01,
+    "maxOrderSize": 100,
+    "sellTargetPrice": 0.05,
+    "autoPlaceOrders": true
+  },
+  "123": {
+    "maxPriceNoTokens": 0.01,
+    "maxOrderSize": 100,
+    "sellTargetPrice": 0.05,
+    "autoPlaceOrders": true
+  },
+  "999999": {
+    "maxPriceNoTokens": 0.008,
+    "maxOrderSize": 120,
+    "sellTargetPrice": 0.05,
+    "autoPlaceOrders": true
+  }
+}
