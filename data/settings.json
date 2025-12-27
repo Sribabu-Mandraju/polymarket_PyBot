@@ -1,7 +1,7 @@
 {
   "1360354055": {
     "maxPriceNoTokens": 0.01,
-    "maxOrderSize": 100,
+    "maxOrderSize": 1,
     "sellTargetPrice": 0.05,
     "autoPlaceOrders": true
   },

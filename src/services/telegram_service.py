@@ -16,12 +16,15 @@ from src.services.polymarket_service import (
     edit_order,
     cancel_order,
 )
+from src.services.order_service import get_market
 from src.utils.logger import get_logger
 from src.utils.settings_store import (
     get_settings_for_chat,
     update_settings_for_chat,
     increment_size_for_chat,
 )
+from src.services.monitor_service import monitor_trades_and_orders
+from src.helpers.clob_client import create_clob_client
 
 
 logger = get_logger(__name__)
@@ -31,6 +34,7 @@ state: Dict[str, Any] = {
     'last_found': [],
 }
 scanning_tasks: Dict[int, asyncio.Task] = {}
+monitor_tasks: Dict[int, asyncio.Task] = {}
 
 
 def _format_ops(ops: List[Dict[str, Any]]) -> str:
@@ -221,7 +225,29 @@ async def _scan_once(chat_id: int, bot) -> None:
                             'eventSlug': market.get('eventSlug'),
                         }
 
-                        results = await place_buy_orders([op], max_order_size, max_price)
+                        # --- Dynamic per-market size: clamp to market minimum ---
+                        # Try to resolve condition/market id to fetch market details
+                        condition_id = op.get('marketId')
+                        min_size = 5
+                        try:
+                            if condition_id:
+                                mk = get_market(str(condition_id))
+                                # Probe several possible keys that may carry the minimum order size
+                                for k in (
+                                    'minOrderSize', 'min_order_size', 'min_size', 'lotSize', 'lot_size', 'minSizePerOrder'
+                                ):
+                                    v = mk.get(k) if isinstance(mk, dict) else None
+                                    if isinstance(v, (int, float)) and v > 0:
+                                        min_size = int(v) if v >= 1 else 1
+                                        break
+                        except Exception:
+                            min_size = 5
+
+                        # User preference from settings: max_order_size
+                        desired_size = int(max_order_size) if isinstance(max_order_size, (int, float)) else 1
+                        final_size = desired_size if desired_size >= min_size else min_size
+
+                        results = await place_buy_orders([op], final_size, max_price)
                         if results and results[0].get('status') == 'submitted':
                             successful_orders.append(market)
                             placed_details.append(results[0])
@@ -427,6 +453,425 @@ async def cancel_order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text(f"❌ Failed to cancel: {result.get('error')}")
 
 
+async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /monitor <conditionId> [tokenId] [durationSeconds] [pollIntervalSeconds]"""
+    chat_id = update.effective_chat.id
+    args = context.args
+    if not args:
+        await update.effective_message.reply_text("Usage: /monitor <conditionId> [tokenId] [durationSeconds] [pollIntervalSeconds]")
+        return
+    if chat_id in monitor_tasks:
+        await update.effective_message.reply_text("Monitor already running. Use /stopmonitor first.")
+        return
+    condition_id = args[0]
+    token_id = args[1] if len(args) >= 2 else None
+    try:
+        duration = int(args[2]) if len(args) >= 3 else 300
+        interval = int(args[3]) if len(args) >= 4 else 10
+    except Exception:
+        await update.effective_message.reply_text("Invalid duration/interval")
+        return
+    await update.effective_message.reply_text("Started monitoring.")
+    task = asyncio.create_task(
+        monitor_trades_and_orders(
+            chat_id,
+            context.bot,
+            condition_id=condition_id,
+            token_id=token_id,
+            poll_interval_seconds=interval,
+            duration_seconds=duration,
+        )
+    )
+    monitor_tasks[chat_id] = task
+
+
+async def stop_monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    task = monitor_tasks.pop(chat_id, None)
+    if task:
+        task.cancel()
+    await update.effective_message.reply_text("Stopped monitoring.")
+
+
+async def orders_live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /orderslive [limit] [scope]
+    scope: open|trades|all (default all)
+    Nicely formatted for Telegram chat.
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+    limit = 20
+    scope = "all"
+    try:
+        if len(args) >= 1:
+            limit = max(1, min(100, int(args[0])))
+        if len(args) >= 2:
+            scope = str(args[1]).lower()
+    except Exception:
+        pass
+
+    client = create_clob_client()
+    # Optional typed params
+    TradeParams = None  # type: ignore[assignment]
+    OpenOrderParams = None  # type: ignore[assignment]
+    try:
+        from py_clob_client.clob_types import TradeParams as _TP, OpenOrderParams as _OP  # type: ignore
+        TradeParams = _TP  # type: ignore[assignment]
+        OpenOrderParams = _OP  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    def _safe_get_address() -> str | None:
+        try:
+            return client.get_address()  # type: ignore[no-any-return]
+        except Exception:
+            return None
+
+    address = _safe_get_address()
+
+    lines = []
+    lines_md: list[str] = []
+    
+    def _addr_eq(a: str | None, b: str | None) -> bool:
+        return bool(a) and bool(b) and str(a).lower() == str(b).lower()
+    
+    # Helper to extract field from object with multiple variations
+    def _get_field_extended(obj, *names):
+        """Try multiple field name variations"""
+        if isinstance(obj, dict):
+            for name in names:
+                if name in obj:
+                    val = obj[name]
+                    if val is not None:
+                        return val
+        else:
+            for name in names:
+                try:
+                    val = getattr(obj, name, None)
+                    if val is not None:
+                        return val
+                except Exception:
+                    continue
+        if isinstance(obj, dict):
+            for name in names:
+                val = obj.get(name)
+                if val is not None:
+                    return val
+        return None
+    
+    # Open orders (filter by address if available)
+    if scope in ("open", "all"):
+        try:
+            params = None
+            if OpenOrderParams is not None and address:
+                try:
+                    params = OpenOrderParams(address=address, limit=limit)  # type: ignore[call-arg]
+                except Exception:
+                    try:
+                        params = OpenOrderParams(maker_address=address, limit=limit)  # type: ignore[call-arg]
+                    except Exception:
+                        params = None
+            open_orders = client.get_orders(params) if params is not None else client.get_orders()
+            open_orders = list(open_orders) if not isinstance(open_orders, list) else open_orders
+            total_before_filter = len(open_orders)
+            
+            # Local filter: only our orders if address known
+            if address:
+                filtered = []
+                for o in open_orders:
+                    try:
+                        # Try many field name variations
+                        maker = _get_field_extended(
+                            o, 'maker_address', 'makerAddress', 'maker', 'MAKER', 'Maker',
+                            'user', 'userAddress', 'owner', 'ownerAddress'
+                        )
+                        if _addr_eq(maker, address):
+                            filtered.append(o)
+                    except Exception:
+                        continue
+                open_orders = filtered
+            
+            open_orders = open_orders[-limit:]
+            lines.append(f"📂 Open Orders (showing {len(open_orders)}):")
+            lines_md.append(f"📂 *Open Orders* (showing {len(open_orders)} of {total_before_filter} total):")
+            if total_before_filter > 0 and len(open_orders) == 0 and address:
+                lines_md.append(f"_Note: Found {total_before_filter} orders but none matched your address. Check field names._")
+            for o in open_orders:
+                try:
+                    oid = _get_field_extended(o, "id", "ID", "order_id", "orderId", "orderID")
+                    side = _get_field_extended(o, "side", "SIDE", "Side")
+                    size = _get_field_extended(o, "size", "SIZE", "Size", "amount", "quantity")
+                    price = _get_field_extended(o, "price", "PRICE", "Price", "px")
+                    token_id = _get_field_extended(o, "token_id", "tokenId", "tokenID", "TOKEN_ID")
+                    lines.append(f" • {side} {size} @ ${price} | token:{token_id} | id:{oid}")
+                    try:
+                        pstr = f"${float(price):.4f}"
+                    except Exception:
+                        pstr = str(price)
+                    lines_md.append(f"• *{side}* {size} @ {pstr}  token: `{token_id}`  id: `{oid}`")
+                except Exception:
+                    continue
+        except Exception as e:
+            lines.append(f"Open orders error: {e}")
+            lines_md.append(f"Open orders error: {e}")
+            logger.exception("Error in orders_live_cmd (open orders)")
+
+    # Trades for our address (filter locally by maker/taker if server-side filter unsupported)
+    if scope in ("trades", "all"):
+        try:
+            api_filtered = False
+            if TradeParams is not None:
+                params = None
+                try:
+                    # Try to pass maker filter and limit if supported by this client version
+                    params = TradeParams(maker_address=address, limit=limit)  # type: ignore[call-arg]
+                    api_filtered = True
+                except Exception:
+                    try:
+                        params = TradeParams(maker_address=address)  # type: ignore[call-arg]
+                        api_filtered = True
+                    except Exception:
+                        params = None
+                trades = client.get_trades(params) if params is not None else client.get_trades()
+            else:
+                trades = client.get_trades()
+            trades = list(trades)
+            total_before_filter = len(trades)
+            # If we used TradeParams with maker_address, trust the API completely
+            # (same as test script - it shows all trades returned by TradeParams)
+            if api_filtered:
+                # API should have filtered, show all returned trades
+                trades = trades[-limit:]
+            elif address:
+                # API didn't filter, do local filtering
+                filtered = []
+                for t in trades:
+                    try:
+                        # Try multiple field name variations (same as test script)
+                        maker = getattr(t, 'maker_address', None) or getattr(t, 'maker', None)
+                        if isinstance(t, dict):
+                            maker = maker or t.get('maker_address') or t.get('maker')
+                        taker = getattr(t, 'taker_address', None) or getattr(t, 'taker', None)
+                        if isinstance(t, dict):
+                            taker = taker or t.get('taker_address') or t.get('taker')
+                        # If we can't find maker/taker fields, include it anyway (might be pre-filtered by API)
+                        if _addr_eq(maker, address) or _addr_eq(taker, address):
+                            filtered.append(t)
+                        elif maker is None and taker is None:
+                            # If fields not found, include it (API might have pre-filtered)
+                            filtered.append(t)
+                    except Exception:
+                        # On error, include it to be safe
+                        filtered.append(t)
+                trades = filtered[-limit:]
+            else:
+                # No address, just limit
+                trades = trades[-limit:]
+            lines.append(f"📈 Recent Trades (showing {len(trades)}):")
+            if api_filtered:
+                lines_md.append(f"\n📈 *Recent Trades* (showing {len(trades)} of {total_before_filter} total, API filtered):")
+            else:
+                lines_md.append(f"\n📈 *Recent Trades* (showing {len(trades)} of {total_before_filter} total):")
+            if total_before_filter > 0 and len(trades) == 0 and address and not api_filtered:
+                lines_md.append(f"_Note: Found {total_before_filter} trades but none matched your address. Check field names._")
+            for t in trades:
+                try:
+                    side = _get_field_extended(t, "side", "SIDE", "Side")
+                    size = _get_field_extended(t, "size", "SIZE", "Size", "amount", "quantity")
+                    price = _get_field_extended(t, "price", "PRICE", "Price", "px")
+                    ts = _get_field_extended(t, "timestamp", "ts", "TS", "Timestamp", "time", "created_at", "createdAt")
+                    token_id = _get_field_extended(t, "token_id", "tokenId", "tokenID", "TOKEN_ID", "TokenId", "asset_id", "assetId")
+                    oid = _get_field_extended(t, "order_id", "orderId", "orderID", "ORDER_ID", "OrderId", "id", "ID")
+                    lines.append(f" • {side} {size} @ ${price} | token:{token_id} | id:{oid} | {ts}")
+                    try:
+                        pstr = f"${float(price):.4f}"
+                    except Exception:
+                        pstr = str(price)
+                    lines_md.append(f"• *{side}* {size} @ {pstr}  token: `{token_id}`  id: `{oid}`  {ts}")
+                except Exception:
+                    continue
+        except Exception as e:
+            lines.append(f"Trades error: {e}")
+            lines_md.append(f"Trades error: {e}")
+            logger.exception("Error in orders_live_cmd (trades)")
+
+    if lines_md:
+        text = "\n".join(lines_md[-200:])
+        if address:
+            text = f"Address: `{address}`\n\n" + text
+        await _send_safe(context.bot, chat_id, text, markdown=True, disable_web_page_preview=True)
+    else:
+        if not lines:
+            msg = "No data found."
+            if address:
+                msg = f"Address: {address}\n\n{msg}"
+            lines.append(msg)
+        await _send_safe(context.bot, chat_id, "\n".join(lines[-200:]), markdown=False)
+
+
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    try:
+        import os
+        client = create_clob_client()
+        addr = None
+        try:
+            addr = client.get_address()
+        except Exception:
+            addr = None
+        pk_present = bool(os.getenv("PK"))
+        pbk_present = bool(os.getenv("PBK"))
+        api_key_present = bool(os.getenv("CLOB_API_KEY"))
+        api_secret_present = bool(os.getenv("CLOB_SECRET"))
+        api_pass_present = bool(os.getenv("CLOB_PASS_PHRASE"))
+        lines = [
+            "🔎 Identity",
+            f"Address: {addr or 'Unavailable'}",
+            "\nConfig checks:",
+            f"PK set: {'Yes' if pk_present else 'No'}",
+            f"PBK set: {'Yes' if pbk_present else 'No'}",
+            f"API creds set: {'Yes' if (api_key_present and api_secret_present and api_pass_present) else 'No'}",
+        ]
+        await _send_safe(context.bot, chat_id, "\n".join(lines), markdown=False)
+    except Exception as e:
+        await _send_safe(context.bot, chat_id, f"whoami error: {e}", markdown=False)
+
+
+async def myorders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /myorders [limit]
+    Shows your open orders and recently filled orders (buys and sells),
+    so you can see what has succeeded (filled buys you could resell).
+    """
+    chat_id = update.effective_chat.id
+    args = context.args
+    limit = 20
+    try:
+        if len(args) >= 1:
+            limit = max(1, min(100, int(args[0])))
+    except Exception:
+        pass
+
+    client = create_clob_client()
+    # Optional typed params
+    TradeParams = None  # type: ignore[assignment]
+    OpenOrderParams = None  # type: ignore[assignment]
+    try:
+        from py_clob_client.clob_types import TradeParams as _TP, OpenOrderParams as _OP  # type: ignore
+        TradeParams = _TP  # type: ignore[assignment]
+        OpenOrderParams = _OP  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    def _get_addr() -> str | None:
+        try:
+            return client.get_address()  # type: ignore[no-any-return]
+        except Exception:
+            return None
+
+    address = _get_addr()
+
+    lines: list[str] = []
+    # Open orders (placed but not filled)
+    try:
+        if OpenOrderParams is not None:
+            open_orders = client.get_orders(OpenOrderParams())
+        else:
+            open_orders = client.get_orders()
+        open_list = list(open_orders)
+        lines.append(f"📂 Open Orders (showing {min(len(open_list), limit)} of {len(open_list)}):")
+        for o in open_list[-limit:]:
+            try:
+                oid = getattr(o, "id", None) or o.get("id")
+                side = getattr(o, "side", None) or o.get("side")
+                size = getattr(o, "size", None) or o.get("size")
+                price = getattr(o, "price", None) or o.get("price")
+                token_id = getattr(o, "token_id", None) or o.get("token_id")
+                lines.append(f" • {side} {size} @ ${price} | token:{token_id} | id:{oid}")
+            except Exception:
+                continue
+    except Exception as e:
+        lines.append(f"Open orders error: {e}")
+
+    # Filled orders (trades) for our address
+    try:
+        if TradeParams is not None:
+            params = None
+            try:
+                params = TradeParams(maker_address=address, limit=limit)  # type: ignore[call-arg]
+            except Exception:
+                try:
+                    params = TradeParams(maker_address=address)  # type: ignore[call-arg]
+                except Exception:
+                    params = None
+            trades = client.get_trades(params) if params is not None else client.get_trades()
+        else:
+            trades = client.get_trades()
+        trades = list(trades)
+        # Keep only our trades (maker/taker equals our address) and last N
+        def _addr_eq(a: str | None, b: str | None) -> bool:
+            return bool(a) and bool(b) and str(a).lower() == str(b).lower()
+
+        my_trades = []
+        for t in trades:
+            try:
+                maker = getattr(t, "maker_address", None) or getattr(t, "maker", None) or (t.get("maker_address") if isinstance(t, dict) else None)
+                taker = getattr(t, "taker_address", None) or getattr(t, "taker", None) or (t.get("taker_address") if isinstance(t, dict) else None)
+                if address is None or _addr_eq(maker, address) or _addr_eq(taker, address):
+                    my_trades.append(t)
+            except Exception:
+                continue
+        my_trades = my_trades[-limit:]
+
+        lines.append("")
+        lines.append(f"✅ Filled Orders (showing {len(my_trades)}):")
+        for t in my_trades:
+            try:
+                side = getattr(t, "side", None) or t.get("side")
+                size = getattr(t, "size", None) or t.get("size")
+                price = getattr(t, "price", None) or t.get("price")
+                ts = getattr(t, "timestamp", None) or t.get("timestamp") or getattr(t, "ts", None) or t.get("ts")
+                token_id = getattr(t, "token_id", None) or t.get("token_id") or getattr(t, "tokenId", None) or t.get("tokenId")
+                lines.append(f" • {side} {size} @ ${price} | token:{token_id} | {ts}")
+            except Exception:
+                continue
+
+        # Optional: summarize filled BUYS (what you can sell)
+        try:
+            from collections import defaultdict
+            net_position = defaultdict(float)
+            avg_cost_numer = defaultdict(float)
+            for t in my_trades:
+                side = (getattr(t, "side", None) or t.get("side")).upper()  # type: ignore[union-attr]
+                size = float(getattr(t, "size", None) or t.get("size") or 0)
+                price = float(getattr(t, "price", None) or t.get("price") or 0)
+                tok = getattr(t, "token_id", None) or t.get("token_id") or getattr(t, "tokenId", None) or t.get("tokenId")
+                if not tok:
+                    continue
+                if side == "BUY":
+                    net_position[tok] += size
+                    avg_cost_numer[tok] += size * price
+                elif side == "SELL":
+                    net_position[tok] -= size
+            lines.append("")
+            lines.append("💼 Positions (net from filled trades):")
+            shown = 0
+            for tok, qty in list(net_position.items())[::-1]:
+                if abs(qty) < 1e-9:
+                    continue
+                avg_cost = (avg_cost_numer[tok] / net_position[tok]) if net_position[tok] > 0 else 0
+                lines.append(f" • token:{tok} | qty:{qty} | avg cost:${avg_cost:.4f}")
+                shown += 1
+                if shown >= 20:
+                    break
+        except Exception:
+            pass
+
+    except Exception as e:
+        lines.append(f"Filled orders error: {e}")
+
+    await _send_safe(context.bot, chat_id, "\n".join(lines[-400:]), markdown=False)
+
+
 async def start_bot() -> None:
     cfg = load_config()
     if not cfg.telegram_bot_token:
@@ -451,6 +896,12 @@ async def start_bot() -> None:
     app.add_handler(CommandHandler("setauto", set_auto_cmd))
     app.add_handler(CommandHandler("editorder", edit_order_cmd))
     app.add_handler(CommandHandler("cancelorder", cancel_order_cmd))
+    app.add_handler(CommandHandler("monitor", monitor_cmd))
+    app.add_handler(CommandHandler("stopmonitor", stop_monitor_cmd))
+    app.add_handler(CommandHandler("orderslive", orders_live_cmd))
+    app.add_handler(CommandHandler("liveorders", orders_live_cmd))
+    app.add_handler(CommandHandler("whoami", whoami_cmd))
+    app.add_handler(CommandHandler("myorders", myorders_cmd))
 
     logger.info("Starting Telegram bot ...")
     await app.initialize()

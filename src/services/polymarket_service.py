@@ -88,6 +88,27 @@ async def place_buy_orders(opportunities: List[Dict[str, Any]], max_shares: int,
                 order_id = resp.get('order_id') or resp.get('id') or resp.get('orderId')
             results.append({**op, 'status': 'submitted', 'order_id': order_id, 'token_id': token_id, 'price': price, 'raw': resp})
         except Exception as e:  # Robust error handling per requirements
+            # If size too small error, parse minimum and retry once with that size
+            try:
+                msg = str(getattr(e, 'error_message', None) or getattr(e, 'args', [''])[0])
+                # examples: "Size (1) lower than the minimum: 5"
+                import re
+                m = re.search(r"minimum:\s*(\d+)", msg)
+                if m:
+                    min_required = int(m.group(1))
+                    if min_required > int(max_shares):
+                        try:
+                            resp2 = await asyncio.to_thread(place_limit_order, token_id, 'BUY', price, int(min_required))
+                            order_id2 = None
+                            if isinstance(resp2, dict):
+                                order_id2 = resp2.get('order_id') or resp2.get('id') or resp2.get('orderId')
+                            results.append({**op, 'status': 'submitted', 'order_id': order_id2, 'token_id': token_id, 'price': price, 'raw': resp2, 'retryWithMin': min_required})
+                            continue
+                        except Exception as e_retry:
+                            results.append({**op, 'status': 'error', 'error': f'retry_failed_min_size_{min_required}: {e_retry}'})
+                            continue
+            except Exception:
+                pass
             logger.exception("Order placement failed for %s: %s", token_id, e)
             results.append({**op, 'status': 'error', 'error': str(e)})
     return results
